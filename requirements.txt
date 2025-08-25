@@ -1,2 +1,2 @@
 openimageio>=3.0.3.1
-clique=2.0.0
+clique==2.0.0
