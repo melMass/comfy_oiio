@@ -316,30 +316,67 @@ class OIIO_ColorspaceConvert:
     CATEGORY = "oiio"
 
     def convert(self, image, input_colorspace="sRGB", output_colorspace=DEFAULT_OUTPUT_TRANSFORM):
-        if input_colorspace == output_colorspace:
+        # No-op if colorspaces match or are set to auto
+        if (
+            input_colorspace == output_colorspace
+            or input_colorspace == "auto"
+            or output_colorspace == "auto"
+        ):
             return (image,)
 
-        pixels = image.squeeze(0).float().cpu().numpy()
-        pixels = np.ascontiguousarray(pixels)
+        # Ensure expected dims: [B,H,W,C] or [H,W,C]
+        if image.dim() == 3:
+            images = image.unsqueeze(0)
+        elif image.dim() == 4:
+            images = image
+        else:
+            raise ValueError(
+                f"Unsupported image tensor dims {image.dim()} for shape {tuple(image.shape)}; expected [H,W,C] or [B,H,W,C]"
+            )
 
-        # input buffer
-        in_spec = oiio.ImageSpec(pixels.shape[1], pixels.shape[0], pixels.shape[2], oiio.FLOAT)
-        roi = oiio.ROI(0, pixels.shape[1], 0, pixels.shape[0], 0, 1, 0, pixels.shape[2])
-        in_buf = oiio.ImageBuf(in_spec)
-        in_buf.set_pixels(roi, pixels)
+        batch_size, height, width, channels = images.shape
+        if channels not in (1, 3, 4):
+            log.warning(
+                f"Unexpected channel count in ColorspaceConvert: {channels}; proceeding but downstream nodes may fail"
+            )
 
-        # output buffer
-        out_buf = oiio.ImageBuf(in_spec)
+        log.debug(
+            f"ColorspaceConvert: converting {batch_size} image(s) of size {width}x{height} with {channels} channels: {input_colorspace} -> {output_colorspace}"
+        )
 
-        if not oiio.ImageBufAlgo.colorconvert(out_buf, in_buf, input_colorspace, output_colorspace):
-            raise RuntimeError(f"Color conversion failed: {out_buf.geterror()}")
+        converted_frames: list[torch.Tensor] = []
+        for i in range(batch_size):
+            frame = images[i].float().cpu().numpy()
+            frame = np.ascontiguousarray(frame)
 
-        result = torch.from_numpy(out_buf.get_pixels(roi=roi))
-        log.info(f"Conversion stats - Input range: [{pixels.min():.3f}, {pixels.max():.3f}]")
-        log.info(f"Conversion stats - Output range: [{result.min():.3f}, {result.max():.3f}]")
+            # Build OIIO buffers (OIIO expects width, height, channels)
+            in_spec = oiio.ImageSpec(width, height, channels, oiio.FLOAT)
+            roi = oiio.ROI(0, width, 0, height, 0, 1, 0, channels)
+            in_buf = oiio.ImageBuf(in_spec)
+            in_buf.set_pixels(roi, frame)
 
-        if result.dim() == 3:
-            result = result.unsqueeze(0)
+            out_buf = oiio.ImageBuf(in_spec)
+            if not oiio.ImageBufAlgo.colorconvert(
+                out_buf, in_buf, input_colorspace, output_colorspace
+            ):
+                raise RuntimeError(f"Color conversion failed: {out_buf.geterror()}")
+
+            result_np = out_buf.get_pixels(roi=roi)
+            result_t = torch.from_numpy(result_np).unsqueeze(0)
+
+            converted_frames.append(result_t)
+
+        result = torch.cat(converted_frames, dim=0)
+
+        # Stats on first frame for quick sanity check
+        try:
+            _in_min, _in_max = images[0].min().item(), images[0].max().item()
+            _out_min, _out_max = result[0].min().item(), result[0].max().item()
+            log.info(
+                f"Conversion stats - Input range: [{_in_min:.3f}, {_in_max:.3f}] | Output range: [{_out_min:.3f}, {_out_max:.3f}]"
+            )
+        except Exception:
+            pass
 
         return (result,)
 
